@@ -8,6 +8,8 @@ from config import BOT_TOKEN, API_ID, API_HASH, ADMIN_IDS
 from database import users, access_requests
 
 
+# ==================== LOGGING ====================
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s"
@@ -16,13 +18,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ==================== BOT ====================
+
 app = Client(
-    "ContentProXBot",
+    name="ContentProXBot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    bot_token=BOT_TOKEN,
+    in_memory=True
 )
 
+
+# ==================== KEYBOARDS ====================
 
 def age_keyboard():
     return InlineKeyboardMarkup([
@@ -85,7 +92,10 @@ def main_keyboard():
     ])
 
 
+# ==================== DATABASE ====================
+
 async def get_or_create_user(tg_user):
+
     user = await users.find_one(
         {"user_id": tg_user.id}
     )
@@ -101,32 +111,22 @@ async def get_or_create_user(tg_user):
         "is_unlocked": False,
         "is_banned": False,
         "referred_by": None,
-        "referral_count": 0
+        "referral_count": 0,
+        "referral_rewarded": False
     }
 
     await users.insert_one(new_user)
 
+    logger.info(
+        "NEW USER CREATED | user_id=%s",
+        tg_user.id
+    )
+
     return new_user
 
 
-async def show_locked(client, chat_id, user_id):
-    user = await users.find_one(
-        {"user_id": user_id}
-    )
-
-    referrals = user.get("referral_count", 0)
-
-    await client.send_message(
-        chat_id,
-        f"🔒 <b>Access Locked</b>\n\n"
-        f"👥 Invite <b>1 new user</b> to unlock access.\n\n"
-        f"📊 Progress: <b>{referrals}/1</b>\n\n"
-        f"Or request manual admin approval.",
-        reply_markup=locked_keyboard(user_id)
-    )
-
-
 async def unlock_user(user_id):
+
     await users.update_one(
         {"user_id": user_id},
         {
@@ -136,88 +136,180 @@ async def unlock_user(user_id):
         }
     )
 
+    logger.info(
+        "USER UNLOCKED | user_id=%s",
+        user_id
+    )
 
-@app.on_message(filters.command("start") & filters.private)
+
+# ==================== ACCESS SCREENS ====================
+
+async def show_locked(client, chat_id, user_id):
+
+    user = await users.find_one(
+        {"user_id": user_id}
+    )
+
+    referrals = user.get(
+        "referral_count",
+        0
+    )
+
+    await client.send_message(
+        chat_id,
+        "🔒 <b>Access Locked</b>\n\n"
+        "👥 Invite <b>1 new user</b> to unlock access.\n\n"
+        f"📊 Progress: <b>{referrals}/1</b>\n\n"
+        "Or request manual admin approval.",
+        reply_markup=locked_keyboard(user_id)
+    )
+
+
+async def show_main_menu(message):
+
+    await message.reply_text(
+        "🔓 <b>Welcome to ContentProX!</b>\n\n"
+        "Your access is active.",
+        reply_markup=main_keyboard()
+    )
+
+
+# ==================== START COMMAND ====================
+
+@app.on_message(
+    filters.command("start") & filters.private
+)
 async def start_command(client, message):
+
+    logger.info(
+        "START RECEIVED | user=%s | text=%s | command=%s",
+        message.from_user.id if message.from_user else None,
+        message.text,
+        message.command
+    )
 
     tg_user = message.from_user
 
     if not tg_user:
         return
 
-    user = await get_or_create_user(tg_user)
+    try:
 
-    # Handle referral parameter
-    if len(message.command) > 1:
-        parameter = message.command[1]
+        user = await get_or_create_user(
+            tg_user
+        )
 
-        if parameter.startswith("ref_"):
+        # ---------- HANDLE REFERRAL ----------
 
-            try:
-                referrer_id = int(
-                    parameter.replace("ref_", "")
-                )
-            except ValueError:
-                referrer_id = None
+        if len(message.command) > 1:
 
-            if (
-                referrer_id
-                and referrer_id != tg_user.id
-                and user.get("referred_by") is None
-            ):
+            parameter = message.command[1]
 
-                referrer = await users.find_one(
-                    {"user_id": referrer_id}
-                )
+            if parameter.startswith("ref_"):
 
-                if referrer:
+                try:
+                    referrer_id = int(
+                        parameter.replace(
+                            "ref_",
+                            ""
+                        )
+                    )
+                except ValueError:
+                    referrer_id = None
 
-                    await users.update_one(
-                        {"user_id": tg_user.id},
+                if (
+                    referrer_id
+                    and referrer_id != tg_user.id
+                    and user.get("referred_by") is None
+                ):
+
+                    referrer = await users.find_one(
                         {
-                            "$set": {
-                                "referred_by": referrer_id
-                            }
+                            "user_id": referrer_id
                         }
                     )
 
-                    user = await users.find_one(
-                        {"user_id": tg_user.id}
-                    )
+                    if referrer:
 
-    # Ban check
-    if user.get("is_banned"):
-        await message.reply_text(
-            "🚫 You are not allowed to use this bot."
+                        await users.update_one(
+                            {
+                                "user_id": tg_user.id
+                            },
+                            {
+                                "$set": {
+                                    "referred_by": referrer_id
+                                }
+                            }
+                        )
+
+                        user = await users.find_one(
+                            {
+                                "user_id": tg_user.id
+                            }
+                        )
+
+                        logger.info(
+                            "REFERRAL LINKED | new_user=%s | referrer=%s",
+                            tg_user.id,
+                            referrer_id
+                        )
+
+        # ---------- BAN CHECK ----------
+
+        if user.get("is_banned"):
+
+            await message.reply_text(
+                "🚫 You are not allowed to use this bot."
+            )
+
+            return
+
+        # ---------- ALREADY UNLOCKED ----------
+
+        if user.get("is_unlocked"):
+
+            await show_main_menu(
+                message
+            )
+
+            return
+
+        # ---------- AGE CONFIRMATION ----------
+
+        if not user.get(
+            "is_adult_confirmed"
+        ):
+
+            await message.reply_text(
+                "🔞 <b>Age Confirmation Required</b>\n\n"
+                "This bot is intended only for users aged "
+                "18 or above.\n\n"
+                "Please confirm your age to continue.",
+                reply_markup=age_keyboard()
+            )
+
+            return
+
+        # ---------- LOCKED ----------
+
+        await show_locked(
+            client,
+            message.chat.id,
+            tg_user.id
         )
-        return
 
-    # Already unlocked
-    if user.get("is_unlocked"):
-        await message.reply_text(
-            "🔓 <b>Welcome back!</b>\n\n"
-            "You have access to ContentProX.",
-            reply_markup=main_keyboard()
+    except Exception:
+
+        logger.exception(
+            "ERROR IN START HANDLER"
         )
-        return
-
-    # Adult confirmation
-    if not user.get("is_adult_confirmed"):
 
         await message.reply_text(
-            "🔞 <b>Age Confirmation Required</b>\n\n"
-            "This bot is intended only for users aged 18 or above.\n\n"
-            "Please confirm your age to continue.",
-            reply_markup=age_keyboard()
+            "❌ Something went wrong. Please try again later."
         )
-        return
 
-    await show_locked(
-        client,
-        message.chat.id,
-        tg_user.id
-    )
 
+# ==================== CALLBACKS ====================
 
 @app.on_callback_query()
 async def callbacks(client, callback):
@@ -225,288 +317,446 @@ async def callbacks(client, callback):
     data = callback.data
     user_id = callback.from_user.id
 
-    user = await users.find_one(
-        {"user_id": user_id}
+    logger.info(
+        "CALLBACK RECEIVED | user=%s | data=%s",
+        user_id,
+        data
     )
 
-    if not user:
-        await callback.answer(
-            "Please restart the bot.",
-            show_alert=True
-        )
-        return
+    try:
 
-    # Adult confirmation
-    if data == "confirm_adult":
-
-        await users.update_one(
-            {"user_id": user_id},
+        user = await users.find_one(
             {
-                "$set": {
-                    "is_adult_confirmed": True
-                }
+                "user_id": user_id
             }
         )
 
-        # Count referral if this user was referred
-        user = await users.find_one(
-            {"user_id": user_id}
-        )
+        if not user:
 
-        referrer_id = user.get("referred_by")
-
-        if referrer_id:
-
-            referrer = await users.find_one(
-                {"user_id": referrer_id}
+            await callback.answer(
+                "Please restart the bot.",
+                show_alert=True
             )
 
-            if referrer:
+            return
 
-                new_count = (
-                    referrer.get("referral_count", 0)
-                    + 1
+        # ==================================================
+        # ADULT CONFIRMATION
+        # ==================================================
+
+        if data == "confirm_adult":
+
+            # Atomically confirm only once
+            result = await users.update_one(
+                {
+                    "user_id": user_id,
+                    "is_adult_confirmed": False
+                },
+                {
+                    "$set": {
+                        "is_adult_confirmed": True
+                    }
+                }
+            )
+
+            user = await users.find_one(
+                {
+                    "user_id": user_id
+                }
+            )
+
+            referrer_id = user.get(
+                "referred_by"
+            )
+
+            # Credit referral only once
+            if (
+                referrer_id
+                and not user.get(
+                    "referral_rewarded",
+                    False
                 )
+            ):
 
-                await users.update_one(
-                    {"user_id": referrer_id},
+                reward_result = await users.update_one(
+                    {
+                        "user_id": user_id,
+                        "referral_rewarded": False
+                    },
                     {
                         "$set": {
-                            "referral_count": new_count
+                            "referral_rewarded": True
                         }
                     }
                 )
 
-                # Unlock after 1 referral
-                if new_count >= 1:
+                if reward_result.modified_count:
 
-                    await unlock_user(
-                        referrer_id
+                    await users.update_one(
+                        {
+                            "user_id": referrer_id
+                        },
+                        {
+                            "$inc": {
+                                "referral_count": 1
+                            }
+                        }
                     )
 
-                    try:
-                        await client.send_message(
-                            referrer_id,
-                            "🎉 <b>Access Unlocked!</b>\n\n"
-                            "Your referral requirement has been completed.",
-                            reply_markup=main_keyboard()
+                    referrer = await users.find_one(
+                        {
+                            "user_id": referrer_id
+                        }
+                    )
+
+                    logger.info(
+                        "REFERRAL CREDITED | referrer=%s | count=%s",
+                        referrer_id,
+                        referrer.get(
+                            "referral_count",
+                            0
                         )
-                    except Exception as e:
-                        logger.warning(
-                            f"Could not notify {referrer_id}: {e}"
+                    )
+
+                    # Unlock referrer after 1 referral
+                    if referrer.get(
+                        "referral_count",
+                        0
+                    ) >= 1:
+
+                        await unlock_user(
+                            referrer_id
                         )
 
-        await callback.message.edit_text(
-            "🔒 <b>Access Locked</b>\n\n"
-            "👥 Invite <b>1 new user</b> to unlock access.\n\n"
-            "📊 Progress: <b>0/1</b>\n\n"
-            "Or request manual admin approval.",
-            reply_markup=locked_keyboard(user_id)
-        )
+                        try:
 
-        await callback.answer(
-            "Age confirmed."
-        )
+                            await client.send_message(
+                                referrer_id,
+                                "🎉 <b>Access Unlocked!</b>\n\n"
+                                "Your referral requirement has "
+                                "been completed.",
+                                reply_markup=main_keyboard()
+                            )
 
-    elif data == "underage":
+                        except Exception:
 
-        await callback.message.edit_text(
-            "🚫 Sorry, this bot is only available "
-            "to users aged 18 or above."
-        )
+                            logger.exception(
+                                "COULD NOT NOTIFY REFERRER | user_id=%s",
+                                referrer_id
+                            )
 
-        await callback.answer()
+            # Get fresh referral progress
+            user = await users.find_one(
+                {
+                    "user_id": user_id
+                }
+            )
 
-    # Request admin approval
-    elif data == "request_approval":
+            referrals = user.get(
+                "referral_count",
+                0
+            )
 
-        existing = await access_requests.find_one(
-            {
+            await callback.message.edit_text(
+                "🔒 <b>Access Locked</b>\n\n"
+                "👥 Invite <b>1 new user</b> to unlock access.\n\n"
+                f"📊 Progress: <b>{referrals}/1</b>\n\n"
+                "Or request manual admin approval.",
+                reply_markup=locked_keyboard(user_id)
+            )
+
+            await callback.answer(
+                "Age confirmed."
+            )
+
+        # ==================================================
+        # UNDERAGE
+        # ==================================================
+
+        elif data == "underage":
+
+            await callback.message.edit_text(
+                "🚫 Sorry, this bot is only available "
+                "to users aged 18 or above."
+            )
+
+            await callback.answer()
+
+        # ==================================================
+        # ADMIN APPROVAL REQUEST
+        # ==================================================
+
+        elif data == "request_approval":
+
+            existing = await access_requests.find_one(
+                {
+                    "user_id": user_id,
+                    "status": "pending"
+                }
+            )
+
+            if existing:
+
+                await callback.answer(
+                    "Your request is already pending.",
+                    show_alert=True
+                )
+
+                return
+
+            request = {
                 "user_id": user_id,
                 "status": "pending"
             }
-        )
 
-        if existing:
-
-            await callback.answer(
-                "Your request is already pending.",
-                show_alert=True
+            await access_requests.insert_one(
+                request
             )
 
-            return
+            username = callback.from_user.username
 
-        request = {
-            "user_id": user_id,
-            "status": "pending"
-        }
+            text = (
+                "🔔 <b>New Access Request</b>\n\n"
+                f"👤 Name: {callback.from_user.first_name}\n"
+                f"🆔 ID: <code>{user_id}</code>\n"
+                f"🔗 Username: "
+                f"{'@' + username if username else 'None'}\n\n"
+                f"👥 Referrals: "
+                f"{user.get('referral_count', 0)}/1"
+            )
 
-        await access_requests.insert_one(
-            request
-        )
+            admin_keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🔓 Approve",
+                        callback_data=f"approve_{user_id}"
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Reject",
+                        callback_data=f"reject_{user_id}"
+                    )
+                ]
+            ])
 
-        username = callback.from_user.username
+            sent_to_admin = False
 
-        text = (
-            "🔔 <b>New Access Request</b>\n\n"
-            f"👤 Name: {callback.from_user.first_name}\n"
-            f"🆔 ID: <code>{user_id}</code>\n"
-            f"🔗 Username: "
-            f"{'@' + username if username else 'None'}\n\n"
-            f"👥 Referrals: "
-            f"{user.get('referral_count', 0)}/1"
-        )
+            for admin_id in ADMIN_IDS:
 
-        admin_keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🔓 Approve",
-                    callback_data=f"approve_{user_id}"
-                ),
-                InlineKeyboardButton(
-                    "❌ Reject",
-                    callback_data=f"reject_{user_id}"
+                try:
+
+                    await client.send_message(
+                        admin_id,
+                        text,
+                        reply_markup=admin_keyboard
+                    )
+
+                    sent_to_admin = True
+
+                except Exception:
+
+                    logger.exception(
+                        "COULD NOT SEND APPROVAL REQUEST | admin=%s",
+                        admin_id
+                    )
+
+            if sent_to_admin:
+
+                await callback.answer(
+                    "Your request has been sent for approval.",
+                    show_alert=True
                 )
-            ]
-        ])
 
-        for admin_id in ADMIN_IDS:
+            else:
+
+                await callback.answer(
+                    "❌ Could not contact the admin.",
+                    show_alert=True
+                )
+
+        # ==================================================
+        # ADMIN APPROVE
+        # ==================================================
+
+        elif data.startswith("approve_"):
+
+            if user_id not in ADMIN_IDS:
+
+                await callback.answer(
+                    "Unauthorized.",
+                    show_alert=True
+                )
+
+                return
+
+            target_id = int(
+                data.replace(
+                    "approve_",
+                    ""
+                )
+            )
+
+            await unlock_user(
+                target_id
+            )
+
+            await access_requests.update_many(
+                {
+                    "user_id": target_id,
+                    "status": "pending"
+                },
+                {
+                    "$set": {
+                        "status": "approved"
+                    }
+                }
+            )
+
+            await callback.message.edit_text(
+                f"✅ User <code>{target_id}</code> approved."
+            )
 
             try:
 
                 await client.send_message(
-                    admin_id,
-                    text,
-                    reply_markup=admin_keyboard
+                    target_id,
+                    "🎉 <b>Your access has been approved!</b>\n\n"
+                    "You can now use ContentProX.",
+                    reply_markup=main_keyboard()
                 )
 
-            except Exception as e:
+            except Exception:
 
-                logger.error(
-                    f"Could not send request to admin "
-                    f"{admin_id}: {e}"
+                logger.exception(
+                    "COULD NOT NOTIFY APPROVED USER | user=%s",
+                    target_id
                 )
-
-        await callback.answer(
-            "Your request has been sent to the admin.",
-            show_alert=True
-        )
-
-    # Admin approval
-    elif data.startswith("approve_"):
-
-        if user_id not in ADMIN_IDS:
 
             await callback.answer(
-                "Unauthorized.",
+                "User approved."
+            )
+
+        # ==================================================
+        # ADMIN REJECT
+        # ==================================================
+
+        elif data.startswith("reject_"):
+
+            if user_id not in ADMIN_IDS:
+
+                await callback.answer(
+                    "Unauthorized.",
+                    show_alert=True
+                )
+
+                return
+
+            target_id = int(
+                data.replace(
+                    "reject_",
+                    ""
+                )
+            )
+
+            await access_requests.update_many(
+                {
+                    "user_id": target_id,
+                    "status": "pending"
+                },
+                {
+                    "$set": {
+                        "status": "rejected"
+                    }
+                }
+            )
+
+            await callback.message.edit_text(
+                f"❌ User <code>{target_id}</code> rejected."
+            )
+
+            await callback.answer(
+                "Request rejected."
+            )
+
+        # ==================================================
+        # CHECK ACCESS
+        # ==================================================
+
+        elif data == "check_access":
+
+            user = await users.find_one(
+                {
+                    "user_id": user_id
+                }
+            )
+
+            if user and user.get(
+                "is_unlocked"
+            ):
+
+                await callback.message.edit_text(
+                    "🔓 <b>Access Granted!</b>\n\n"
+                    "Welcome to ContentProX.",
+                    reply_markup=main_keyboard()
+                )
+
+            else:
+
+                await callback.answer(
+                    "🔒 You have not unlocked access yet.",
+                    show_alert=True
+                )
+
+        # ==================================================
+        # UNIMPLEMENTED BUTTONS
+        # ==================================================
+
+        elif data in [
+            "search",
+            "browse",
+            "profile"
+        ]:
+
+            await callback.answer(
+                "🚧 This feature is coming soon!",
                 show_alert=True
             )
 
-            return
+    except Exception:
 
-        target_id = int(
-            data.replace("approve_", "")
-        )
-
-        await unlock_user(target_id)
-
-        await access_requests.update_many(
-            {
-                "user_id": target_id,
-                "status": "pending"
-            },
-            {
-                "$set": {
-                    "status": "approved"
-                }
-            }
-        )
-
-        await callback.message.edit_text(
-            f"✅ User <code>{target_id}</code> approved."
+        logger.exception(
+            "ERROR IN CALLBACK HANDLER | data=%s | user=%s",
+            data,
+            user_id
         )
 
         try:
 
-            await client.send_message(
-                target_id,
-                "🎉 <b>Your access has been approved!</b>\n\n"
-                "You can now use ContentProX.",
-                reply_markup=main_keyboard()
-            )
-
-        except Exception as e:
-
-            logger.warning(
-                f"Could not notify user {target_id}: {e}"
-            )
-
-        await callback.answer(
-            "User approved."
-        )
-
-    # Admin rejection
-    elif data.startswith("reject_"):
-
-        if user_id not in ADMIN_IDS:
-
             await callback.answer(
-                "Unauthorized.",
+                "❌ Something went wrong.",
                 show_alert=True
             )
 
-            return
+        except Exception:
+            pass
 
-        target_id = int(
-            data.replace("reject_", "")
-        )
 
-        await access_requests.update_many(
-            {
-                "user_id": target_id,
-                "status": "pending"
-            },
-            {
-                "$set": {
-                    "status": "rejected"
-                }
-            }
-        )
-
-        await callback.message.edit_text(
-            f"❌ User <code>{target_id}</code> rejected."
-        )
-
-        await callback.answer(
-            "Request rejected."
-        )
-
-    # Check access
-    elif data == "check_access":
-
-        user = await users.find_one(
-            {"user_id": user_id}
-        )
-
-        if user.get("is_unlocked"):
-
-            await callback.message.edit_text(
-                "🔓 <b>Access Granted!</b>\n\n"
-                "Welcome to ContentProX.",
-                reply_markup=main_keyboard()
-            )
-
-        else:
-
-            await callback.answer(
-                "🔒 You have not unlocked access yet.",
-                show_alert=True
-            )
-
+# ==================== MAIN ====================
 
 async def main():
 
+    logger.info(
+        "STARTING CONTENTPROXBOT..."
+    )
+
     await app.start()
+
+    me = await app.get_me()
+
+    logger.info(
+        "RUNNING AS: @%s | BOT ID: %s",
+        me.username,
+        me.id
+    )
 
     logger.info(
         "ContentProXBot started successfully."
@@ -517,4 +767,14 @@ async def main():
 
 if __name__ == "__main__":
 
-    asyncio.run(main())
+    try:
+
+        asyncio.run(
+            main()
+        )
+
+    except KeyboardInterrupt:
+
+        logger.info(
+            "ContentProXBot stopped."
+    )
