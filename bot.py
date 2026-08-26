@@ -173,6 +173,13 @@ async def show_main_menu(message):
         reply_markup=main_keyboard()
     )
 
+# ===================== Temp Debug Line =================
+@app.on_raw_update()
+async def raw_update_debug(client, update, users, chats):
+    logger.info(
+        "RAW UPDATE RECEIVED | %s",
+        type(update).__name__
+    )
 
 # ==================== START COMMAND ====================
 
